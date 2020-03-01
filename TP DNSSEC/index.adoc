@@ -1,0 +1,817 @@
+= Serveurs DNS
+v0.1.0, mars 2020
+////
+revnumber and revdate must be separated by a comma (,).                                                          1.0
+revdate can contain words, letters, numbers, and symbols.                                                        October 2, 2013
+The revremark attribute must be preceded by a colon (:), regardless of whether revnumber or revdate are set.     AsciiDoctor Template
+////
+:encoding: utf-8
+:lang: fr
+:experimental:
+:toc: left
+:toclevels: 4
+:sectanchors:
+:sectlinks:
+:sectnums:
+:sectnumlevels: 3
+:icons: font
+// :author: Firstname Lastname
+// :email: author@asciidoctor.org
+// :revnumber: 1.0
+// :revdate: October 2, 2013
+// :revremark: AsciiDoctor Template
+// :imagesdir: images
+:doctype: article
+:icons: font
+:source-highlighter: pygments
+// :stylesheet:
+//:data-uri:
+//:allow-uri-read:
+
+L'objectif de ce TP est de mettre en place une arborescence DNSSEC à partir de BIND (_Berkeley Internet Name Domain_)
+
+== Introduction
+
+Les différentes étapes :
+
+  * Création des machines virtuelles
+	* Configuration du réseau
+	* Configuration de l'arborescence DNS
+	* Configuration de DNSSEC
+
+=== À quoi sert DNSSEC ?
+
+Lorsque DNSSEC n'est pas activé sur un domaine, une personne malveillante pourrait modifier la correspondance entre le nom de domaine et l'adresse IP (au niveau du FAI, par exemple). Dans ce cas, l'internaute serait trompé sur le serveur qu'il pense intérroger.
+
+DNSSEC permet de sécuriser l’authenticité de la réponse fournie par le serveur DNS. Si un hacker tentait de modifier l’adresse IP du nom de domaine dans un serveur DNS protégé par DNSSEC au moment de la résolution, ce dernier refuserait ainsi ses requêtes, car elles ne seraient pas authentifiées.
+
+== Mise en place de l'infrastructure
+
+image::images\DNS TP1.png[]
+
+La structure est virtualisée. On a besoin de quatre machines virtuelles. Ainsi que de trois LAN virtuels. C'est pour cette raison que nous avons besoin de VirtualBox qui est un https://sio.manastria.com/wiki/doku.php?id=reseau:virtu#hyperviseur_de_type_2[hyperviseur de type 2] tout comme VMWare Player. À la différence de VMWare Player, VirtualBox est plus complet (comme VMWare Desktop) mais aussi plus complexe à mettre en œuvre.
+
+On commence par créer une machine type que nous allons cloner par la suite.
+
+=== Avant de cloner les machines
+==== Préparation de la machine virtuelle
+
+À faire :
+
+  . Décompresser la machine virtuelle : « TP VirtBox Debian10 2020030101 »
+  . Dans la configuration de la VM :
+
+  * mettre l'interface réseau en mode « pont »
+  * et regénérer une adresse MAC. Il ne faudrait pas que vous ayez tous la même adresse MAC sur le réseau SIO !
+
+image::images\DNS_TP1-3142e.png[]
+
+==== Installer les paquets
+
+Tous les paquets ne seront pas utilisé sur toutes les machines. Mais l'objectif est d'économiser le temps d'installation.
+
+----
+# apt install -y bind9 bind9-host dnsutils iptables-persistent
+----
+
+==== Création du répertoire pour les fichiers de zone
+
+On installera les fichiers de zone DNS dans le répertoire `/var/lib/bind/master`. Ce répertoire n'existe pas par défaut, il faut le créer.
+
+----
+# mkdir -p /var/lib/bind/master
+# chown -R bind:bind /var/lib/bind/master
+----
+
+==== Création d'un template pour la configuration des interfaces
+
+Pour faciliter la configuration des interfaces, remplacer le fichier `/etc/network/interfaces` par le contenu suivant :
+
+./etc/network/interfaces
+----
+# This file describes the network interfaces available on your system
+# and how to activate them. For more information, see interfaces(5).
+
+source /etc/network/interfaces.d/*
+
+# The loopback network interface
+auto lo
+iface lo inet loopback
+
+# The primary network interface
+allow-hotplug enp0s3
+iface enp0s3 inet dhcp
+
+# allow-hotplug enp0s3
+# iface enp0s3 inet static
+#   address x.x.x.x
+#   netmask x.x.x.x
+#   gateway x.x.x.x
+#
+# allow-hotplug enp0s8
+# iface enp0s8 inet static
+#   address x.x.x.x
+#   netmask x.x.x.x
+# #  dns-nameservers X.X.X.X
+#
+# allow-hotplug enp0s9
+# iface enp0s9 inet static
+#   address x.x.x.x
+#   netmask x.x.x.x
+# #  dns-nameservers X.X.X.X
+#
+# allow-hotplug enp0s10
+# iface enp0s10 inet static
+#   address x.x.x.x
+#   netmask x.x.x.x
+# #  dns-nameservers X.X.X.X
+----
+
+==== Désactiver la configuration DNS par le client DHCP
+
+Le client DHCP va écraser le fichier `/etc/resolv.conf`. Le fichier suivant va empecher cette modification.
+
+----
+cat > /etc/dhcp/dhclient-enter-hooks.d/nodnsupdate <<EOF
+#!/bin/sh
+make_resolv_conf(){
+	:
+}
+EOF
+chmod +x /etc/dhcp/dhclient-enter-hooks.d/nodnsupdate
+----
+
+// ----
+// chattr +i /etc/resolv.conf
+// ----
+
+==== Resolveur
+Configuration par défaut pour le résolveur de nom d'hôte :
+
+// https://www.shellhacks.com/setup-dns-resolution-resolvconf-example/
+
+./etc/resolv.conf
+----
+cat > /etc/resolv.conf <<EOF
+nameserver 127.0.0.1      # DNS server IP
+nameserver 192.168.1.1    # DNS server IP
+domain domaine.projet     # Domain Name of local host
+search domaine.projet     # Which Domain to search
+EOF
+----
+
+Le premier serveur DNS interroger par le résolveur sera celui hébergé sur la machine (127.0.0.1) sinon, ce sera celui du FAI (192.168.1.1).
+
+Pour vous, il faudra remplacer 192.168.1.1 par le serveur DNS du réseau SIO.
+
+==== Nettoyer la machine
+
+Avant de cloner la machine, on va la nettoyer et réinitialiser certains paramètres :
+
+----
+# /root/debian_tp_install/clean_system.sh
+----
+
+En cas de problème avec la génération des clés SSH :
+
+----
+# dpkg-reconfigure openssh-server
+----
+
+=== Cloner les machines
+
+Faire quatre clones liés de la VM (en mode expert). Le clone lié permet d'économiser l'espace disque en utilisant les données de la machine d'origine dont il est dépendant. Les nommer M1, M2, M3 et M4.
+
+On appelera les machines M1, M2, M3 et M4
+
+image::images\DNS_TP1-be83e.png[]
+
+=== Juste après le clonage
+
+Les 4 machines clonées occupent 9Mo sur le disque !!!!
+
+==== Connecter les cartes réseau
+
+Faire le lien entre les interfaces physique et leur nom sous Linux : https://sio.manastria.com/wiki/doku.php?id=virtualbox:reperenic:start
+
+Réaliser un tableau comme <<A2,table de connexion>> pour vous aider par la suite.
+
+===== Pour M1
+    * Ajouter 3 cartes réseau
+    * Connecter chacune de ces cartes sur un réseau interne respectivement : LAN2, LAN3 et LAN4
+
+Se fier à votre tableau <<A2,table de connexion>>
+
+image::images\DNS_TP1-c1da3.png[]
+
+===== Pour les autres
+
+  * Conserver l'unique carte réseau.
+  * Connecter chaque machine sur un réseau interne différent.
+  ** M2 sur LAN2
+  ** M3 sur LAN3
+  ** M4 sur LAN4
+
+==== Donner un nom aux machines
+Vous allez travailler sur 4 machines en même temps... Leur donner un nom facilitera le travail en ligne de commande.
+
+Exemple de commande pour la machine `m1` :
+----
+# hostnamectl set-hostname m1.projet
+----
+
+==== Configurer l'adresse IP de toutes les machines.
+
+Les machines M2, M3 et M4 ont une adresse IP de la forme 10.0.x.10.
+
+Prenez exemple sur cette <<A2,table de connexion>> pour configurer les adresses.
+
+==== Tester la connectivité
+
+À partir de M1, faire un ping vers les autres machines.
+
+
+==== Faire un instantané
+Vous avez bien travaillé. Réaliser un instantané de chaque machine afin de pouvoir revenir à cette étape en cas de problème par la suite : ce serait dommage de tout recommencer !
+
+Si tout fonctionne, stopper les machines et faire un instantané nommé : « IP OK »
+
+image::images\DNS_TP1-ef8ff.png[]
+
+=== Connexion SSH avec rebond
+
+À partir du réseau SIO, nous n'avons accès qu'à la machine M1.
+
+Nous allons configurer le client SSH pour qu'il puisse atteindre les machines M2, M3 et M4 en passant par M1. Nous allons atteindre les autres machines en rebondissant sur M1.
+
+==== Client SSH en ligne de commande
+
+Avec le client OpenSSH, il suffit de renseigner le fichier de configuration en utilisant la commande `ProxyCommand`. La commande ssh se connecter sur m1 défini plus haut dans le fichier de configuration. L'option -W indique qu'il faut faire suivre la connexion vers %h (variable du paramètre Hostname) sur le port 22.
+
+ForwardAgent permet d'utiliser les clés de l'agent SSH pour une connexion avec rebond. Pour utiliser des clés de connexion plutôt qu'un mot de passe : https://sio.manastria.com/wiki/doku.php?id=reseau:ssh:generatekey
+
+----
+cat ~/.ssh/config <<EOF
+Host *
+User root
+ForwardAgent yes
+
+Host m1
+Hostname 192.168.1.31
+
+Host m2
+Hostname 10.0.2.10
+ProxyCommand ssh m1 -W %h:22
+
+Host m3
+Hostname 10.0.3.10
+ProxyCommand ssh m1 -W %h:22
+
+Host m4
+Hostname 10.0.4.10
+ProxyCommand ssh m1 -W %h:22
+EOF
+----
+
+==== Client SSH graphique
+
+Créer une session pour chaque machine.
+
+image::images\DNS_TP1-31fc2.png[]
+
+Mettre en (1) l'adresse de la machine de M2, M3 ou M4 et en (2) l'adresse de M1.
+
+Créer des groupes pour faciliter les connexions multiples.
+
+==== Alternative
+
+Il serait également possible de lancer les commandes SSH à partir d'une session SSH ouverte sur M1.
+
+=== Activer le routage sur M1
+
+M1 est au centre de la topologie. On lui demandera de router les paquets entre les différents réseaux et de permettre un accès au réseau SIO en faisant du NAT.
+
+  * La documentation sur le routage : https://sio.manastria.com/wiki/doku.php?id=reseau:debian:routage
+  * La documentation sur le NAT : https://sio.manastria.com/wiki/doku.php?id=sisr5:iptablesnat#masquerading
+
+L'objectif est d'offrir un accès à Internet à M2, M3 et M4. Puisque ces machines n'ont pas accès au réseau SIO, nous allons faire du SNAT à partir de M1.
+
+Cette commande dit que tous les paquets routés dont l'interface de sortie est `ppp0` seront réécrit avec l'adresse IP de ppp0 commen adresse IP source. À vous de l'adapter à votre configuration.
+
+----
+# iptables -t nat -A POSTROUTING -o ppp0 -j MASQUERADE
+----
+
+Une fois que le NAT fonctionne, il faut enregistrer la modification pour ne pas la perdre au redémarrage.
+
+----
+# /etc/init.d/netfilter-persistent save
+----
+
+// iptables -t nat -A POSTROUTING -o enp0s3 -j MASQUERADE
+
+
+
+== Configuration des serveurs DNS
+
+=== Fichiers de configuration
+
+Normalement la configuration est répartie sur 4 fichiers :
+
+  * `named.conf` : il inclut les fichiers suivants :
+	** `named.conf.options` : la configuration de BIND
+	** `named.conf.defaults` : les zones par défaut.
+	** `named.conf.local` : la configuration des zones que nous ajoutons
+
+Pour simplifier la tâche, nous allons réunir tous ces fichiers dans `named.conf`
+
+=== Configuration de M3
+
+C'est le serveur autoritaire pour le domaine « projet ». Le domaine racine !
+
+./etc/bind/named.conf
+----
+options {
+    directory "/var/cache/bind";
+
+    dnssec-validation no;
+    dnssec-enable no;
+    recursion no;
+    allow-query     { any; };
+    listen-on-v6 { none; };
+};
+
+zone "." {
+    type hint;
+    file "/var/lib/bind/master/db.root.hints";
+};
+
+zone "projet" {
+    type master;
+    file "/var/lib/bind/master/db.projet";
+};
+----
+
+./var/lib/bind/master/db.projet
+----
+$TTL 2h
+$ORIGIN projet.
+@       IN      SOA     server.projet. postmaster.projet. (
+        2020010101       ; serial
+        8H               ; refresh
+        2H               ; retry
+        1W               ; expire
+        1D               ; ttl
+        )
+@       IN       NS     server.projet.
+@       IN       A      10.0.3.10
+server  IN       A      10.0.3.10
+
+$ORIGIN domaine.projet.
+@               IN      NS      server
+server          A               10.0.4.10
+
+; vim: ft=bindzone ts=4 sw=4 sts=4 et :
+----
+
+
+./var/lib/bind/master/db.root.hints
+----
+.              3600000   IN   NS   projet.
+projet.        3600000        A    10.0.3.10
+----
+
+=== Configuration de M4
+M4 est un serveur autoritaire pour domaine.projet
+
+./etc/bind/named.conf
+----
+options {
+        directory "/var/cache/bind";
+
+        dnssec-validation no;
+        dnssec-enable no;
+        recursion no;
+        allow-query     { any; };
+        listen-on-v6 { none; };
+};
+
+zone "." {
+        type hint;
+        file "/var/lib/bind/master/db.root.hints";
+};
+
+
+zone "domaine.projet" {
+                type master;
+                file "/var/lib/bind/master/db.domaine.projet";
+};
+
+----
+
+
+./var/lib/bind/master/db.root.hints
+----
+.              3600000   IN   NS   projet.
+projet.        3600000        A    10.0.2.10
+----
+
+./var/lib/bind/master/db.domaine.projet
+----
+$TTL 2h
+$ORIGIN domaine.projet.
+@       IN      SOA     server.domaine.projet. postmaster.projet. (
+        2020010101       ; serial
+        8H               ; refresh
+        2H               ; retry
+        1W               ; expire
+        1D               ; ttl
+        )
+@       IN      NS      server.domaine.projet.
+server  A       10.0.3.10
+ciel    A       10.0.3.11
+
+; vim: ft=bindzone ts=4 sw=4 sts=4 et :
+----
+
+
+
+
+=== Configuration de M1
+M1 serveur récursif
+
+Ensuite, BIND connaît par défaut l'adresse de tous les serveurs root de la planète. Il va donc falloir lui indiquer que le seul serveur root qu'il doit contacter est pc3. Pour cela, ouvrez le fichier /etc/bind/db.root et supprimez toutes les lignes autres que les deux premières qu'il faut renseigner comme suit :
+
+----
+# cat $ndconf
+options {
+        directory "/var/cache/bind";
+        dnssec-validation no;
+        dnssec-enable no;
+        recursion yes;
+        allow-query     { any; };
+
+        listen-on-v6 { none; };
+};
+
+zone "." {
+        type hint;
+        file "/var/lib/bind/master/db.root.hints";
+};
+
+zone "localhost" {
+        type master;
+        file "/etc/bind/db.local";
+};
+----
+
+
+
+----
+# cat > /var/lib/bind/master/db.root.hints <<EOF
+.              3600000   IN   NS   projet.
+projet.        3600000        A    10.0.2.10
+EOF
+----
+
+
+
+
+
+
+
+// =============================
+// ==  DNSSEC
+// =============================
+
+== Configuration de DNSSEC
+
+=== Les enregistrements RR
+
+The resource record types are:
+
+  * RRSIG (for digital signature),
+	* DNSKEY (the public key),
+	* DS (Delegation Signer),
+	* and NSEC (pointer to next secure record).
+
+The message header bits are:
+
+	* AD (for authenticated data)
+	* and CD (checking disabled).
+
+
+=== Configuration générique
+
+==== Étape 1 : Génération des paires de clés
+
+
+Prenez note de la sortie des commandes. Sinon, il sera difficile de différentier les deux clés.
+Noter le nom du fichier pour la clé KSK et DSK.
+
+Dans la commande, remplacer `mondomaine` par le FQDN de votre domaine.
+
+A faire dans le répertoire `/etc/bind`
+
+Génération de la clé KSK :
+----
+dnssec-keygen -f KSK -a RSASHA1 -b 1024 -n ZONE mondomaine
+----
+
+Génération de la clé ZSK (pour la zone) :
+----
+dnssec-keygen -a RSASHA1 -b 1024 -n ZONE mondomaine
+----
+
+
+
+// ----
+// cd /etc/bind
+// root@m4 bind# dnssec-keygen -f KSK -a RSASHA1 -b 1024 -n ZONE domaine.projet
+// Generating key pair.........................................................................................................+++++ .................+++++
+// Kdomaine.projet.+005+03163
+// root@m4 bind# dnssec-keygen -a RSASHA1 -b 1024 -n ZONE domaine.projet
+// Generating key pair.........+++++ ........+++++
+// Kdomaine.projet.+005+11061
+// ----
+
+
+
+==== Étape 2 : Ajouter les enregistrements
+
+Dans le fichier de zone :
+----
+$include nom_du_fichier_KSK.key
+$include nom_du_fichier_ZSK.key
+----
+
+==== Étape 3 : Signature de la zone
+
+Dans le répertoire `/etc/bind`
+
+Remplacer monDomaine par le FQDN.
+Remplacer monFichierDeZone par le chemin `/var/lib/bind/master/db.…`
+
+----
+dnssec-signzone -S -g -a -o monDomaine monFichierDeZone
+----
+
+Ceci crée le fichier projet.signed qui contient l'ensemble des enregistrements de la zone complétés par les enregistrements de DNSSEC (RRSIG et NSEC notamment)
+
+==== Étape 4 : Configuration de BIND
+
+https://www.zytrax.com/books/dns/ch7/security.html#dnssec-validation
+
+----
+dnssec-enable yes;
+----
+
+
+=== Sur M4
+
+Suivre les quatre étapes
+
+
+=== Sur M3
+
+Ajout du fichier `dsset-domaine.projet.` contenu dans M4. Ce fichier contien les RR DS.
+
+Signer la zone mais sans l'option `-g` qui supprime les RR DS.
+
+
+=== M1
+
+
+Copier le texte de la clé KSK à partir de M3 pour ajouter dans le fichier `named.conf` la directive `trusted-keys` qui ressemble à ceci :
+
+----
+trusted-keys {
+     "projet." 257 3 5 "AwEAAdBRv…mjvMJ";
+};
+----
+
+
+
+=== M2
+
+Sur M3 : # tail -n 1 /etc/bind/Kprojet.+005+41881.key
+projet. IN DNSKEY 257 3 5 AwEAAdBRvKqAZ9K6otXZSiqLJVScFWk3DgM2bmawFskd7i4Hj8skUTi2 WX1znei+LWqFYzYkCGhpPnoeEZHehHhjUPfGyv9aeME9xji1vkp5/aVX PhKnVsUI3R/W2bP4C5dRa3bJ/jlLyn1R1mf7dmTAy7ul6Aef4fVSD6Ig zEgmjvMJ
+
+----
+cat > /etc/trusted-key.key <<EOF
+projet. IN DNSKEY 257 3 5 AwEAAdBRvKqAZ9K6otXZSiqLJVScFWk3DgM2bmawFskd7i4Hj8skUTi2 WX1znei+LWqFYzYkCGhpPnoeEZHehHhjUPfGyv9aeME9xji1vkp5/aVX PhKnVsUI3R/W2bP4C5dRa3bJ/jlLyn1R1mf7dmTAy7ul6Aef4fVSD6Ig zEgmjvMJ
+EOF
+----
+
+
+apt purge bind9
+
+
+
+./etc/resolv.conf
+----
+nameserver 10.0.2.1
+#nameserver 192.168.1.1
+search domaine.projet
+domain domaine.projet
+----
+
+
+
+
+
+
+
+
+
+== ANNEXES
+
+[[A1]]
+=== Infos système sur bind
+
+La commande `netstat` (_network statistics) est remplacée par la commande `ss` (_sockets statistics_)
+
+La commande suivante indique sur quelles adresses et sur quels ports le processus écoute.
+
+----
+# ss -lpn | grep named
+u_dgr UNCONN 0       0                   * 16437              * 10775     users:(("named",pid=561,fd=3))
+udp   UNCONN 0       0        192.168.1.31:53           0.0.0.0:*         users:(("named",pid=561,fd=514))
+udp   UNCONN 0       0           127.0.0.1:53           0.0.0.0:*         users:(("named",pid=561,fd=513))
+udp   UNCONN 0       0                [::]:53              [::]:*         users:(("named",pid=561,fd=512))
+tcp   LISTEN 0       10       192.168.1.31:53           0.0.0.0:*         users:(("named",pid=561,fd=23))
+tcp   LISTEN 0       10          127.0.0.1:53           0.0.0.0:*         users:(("named",pid=561,fd=22))
+tcp   LISTEN 0       128         127.0.0.1:953          0.0.0.0:*         users:(("named",pid=561,fd=24))
+tcp   LISTEN 0       10               [::]:53              [::]:*         users:(("named",pid=561,fd=21))
+tcp   LISTEN 0       128             [::1]:953             [::]:*         users:(("named",pid=561,fd=25))
+----
+
+
+La commande suivante indique les informations concernant le processus
+----
+# ps up $(pgrep -d, named)
+USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+bind       561  0.0  4.5 230048 22556 ?        Ssl  09:48   0:00 /usr/sbin/named -u bind
+----
+
+[[A2]]
+=== Connexion de M1
+.Connexions virtuelles de M1
+[cols="5*",options="header", stripes=even]
+|===
+^|Interface VB
+^|Mode de connexion
+^|Interface Linux
+^|adresse MAC
+^|IP
+
+|Adapter 1
+|Pont
+^|enp0s3
+^|08:00:27:e8:62:91
+| _DHCP_
+
+|Adapter 2
+|Réseau interne : LAN2
+^|enp0s8
+^|08:00:27:fb:f6:e4
+| 10.0.2.x
+
+|Adapter 3
+|Réseau interne : LAN3
+^|enp0s9
+^|08:00:27:98:6e:89
+| 10.0.3.x
+
+|Adapter 4
+|Réseau interne : LAN4
+^|enp0s10
+^|08:00:27:ee:48:a3
+| 10.0.4.x
+|===
+
+Pour réaliser ce tableau, récupérer les informations des cartes sur M1.
+
+// https://asciidoctor.org/docs/user-manual/#applying-substitutions   37.7
+.Exécution sur M1
+[source,subs="verbatim,quotes"]
+----
+# **ip link**
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+2: #enp0s3#: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP mode DEFAULT group default qlen 1000
+    link/ether #08:00:27:e8:62:91# brd ff:ff:ff:ff:ff:ff
+3: #enp0s8#: <BROADCAST,MULTICAST> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+    link/ether #08:00:27:fb:f6:e4# brd ff:ff:ff:ff:ff:ff
+4: #enp0s9#: <BROADCAST,MULTICAST> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+    link/ether #08:00:27:98:6e:89# brd ff:ff:ff:ff:ff:ff
+5: #enp0s10#: <BROADCAST,MULTICAST> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+    link/ether #08:00:27:ee:48:a3# brd ff:ff:ff:ff:ff:ff
+----
+
+=== Vider le cache de BIND
+
+----
+rndc flush
+----
+
+=== Vérifier la configurations
+
+----
+# named-checkconf
+# named-checkzone
+----
+
+
+=== Divers
+
+==== Sauvegarde des fichiers de configuration
+
+----
+ssh m1 "tar cf - --ignore-failed-read /etc/trusted-key.key /etc/bind /var/lib/bind/master /etc/network/interfaces /etc/resolv.conf | bzip2 -9" > m1.tar.bz2
+ssh m2 "tar cf - --ignore-failed-read /etc/trusted-key.key /etc/bind /var/lib/bind/master /etc/network/interfaces /etc/resolv.conf | bzip2 -9" > m2.tar.bz2
+ssh m3 "tar cf - --ignore-failed-read /etc/trusted-key.key /etc/bind /var/lib/bind/master /etc/network/interfaces /etc/resolv.conf | bzip2 -9" > m3.tar.bz2
+ssh m4 "tar cf - --ignore-failed-read /etc/trusted-key.key /etc/bind /var/lib/bind/master /etc/network/interfaces /etc/resolv.conf | bzip2 -9" > m4.tar.bz2
+----
+
+==== Le fichier des alias
+
+----
+cat > r.sh <<EOF
+ndconf="/etc/bind/named.conf"
+rhint="/var/lib/bind/master/db.root.hints"
+zones="/var/lib/bind/master"
+ifaces="/etc/network/interfaces"
+resconf="/etc/resolv.conf"
+dbind="/etc/bind"
+
+alias mtd="multitail -ev \"ntp\" /var/log/daemon.log"
+alias rboot="logout && reboot"
+EOF
+----
+
+==== Joindre le fichier named.conf
+
+----
+cat named.conf.options named.conf.default-zones named.conf.local >! named.conf
+----
+
+==== Teste de la configuration avec la commande dig
+----
+# dig +norecurse server.projet
+# dig +dnssec +sigchase ciel.domaine.projet
+----
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+==== Utilisation de Vim
+
+
+Pour vim :
+----
+" For everything else, use a tab width of 4 space chars.
+set tabstop=4       " The width of a TAB is set to 4.
+                    " Still it is a \t. It is just that
+                    " Vim will interpret it to be having
+                    " a width of 4.
+set shiftwidth=4    " Indents will have a width of 4.
+set softtabstop=4   " Sets the number of columns for a TAB.
+set expandtab       " Expand TABs to spaces.
+----
+
+Remplacer toutes les tabulations par des espaces.
+----
+:%retab
+----
+
+Relire le modeline
+----
+:e
+----
+
+
+// == Checklist
+//
+// // Make interactive checklist.
+// [options="interactive"]
+// .Shopping cart
+// * [x] Milk
+// * [ ] Sugar
+// * [*] Chocolate
